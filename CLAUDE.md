@@ -12,7 +12,9 @@ cd ~/dev/my-garmin-data && uv run sync_garmin_data.py && uv run consolidate_garm
 
 **What happens:**
 
-1. `sync_garmin_data.py` pulls raw JSON from Garmin Connect into `~/garmin_data/`. Only fetches what doesn't exist locally. Automatically backfills missing files for existing days. Last 2 days are always refreshed (late-arriving data). If tokens (`~/.garminconnect`) are expired, prompts for email, password, and MFA (fails fast in non-interactive mode).
+1. `sync_garmin_data.py` pulls raw JSON from Garmin Connect into `~/garmin_data/`. Only fetches what doesn't exist locally. Automatically backfills missing files for existing days. The last 14 days are always refreshed (catches retroactively logged data: lifestyle tags, hydration, food). Tokens are stored as `~/.garminconnect/garmin_tokens.json` (single file format, since `garminconnect>=0.3.0`). If tokens are expired, prompts for email, password, and MFA (fails fast in non-interactive mode).
+
+**Auth notes (April 2026):** the `garth` library was deprecated in March 2026 after Garmin tightened Cloudflare bot detection. Since `garminconnect 0.3.0`, auth uses native DI OAuth + `curl_cffi` for TLS impersonation — no browser automation needed. A full re-login is only required if the refresh token expires (~year) or is revoked. The previous `oauth1_token.json` / `oauth2_token.json` format is obsolete; old files were backed up to `~/.garminconnect.bak.2026-04-25/` during the migration and can be deleted once the new flow is confirmed stable.
 2. `consolidate_garmin_data.py` reads all raw JSON and produces one summary file at `~/garmin_data/claude_summary/garmin_data.csv`. Incremental — only processes new days/activities. Original data is never modified. Writes atomically via temp file.
 
 ## What data is synced
@@ -30,6 +32,7 @@ cd ~/dev/my-garmin-data && uv run sync_garmin_data.py && uv run consolidate_garm
 - Hydration (fluid intake, goal, sweat loss)
 - Intensity minutes (moderate, vigorous)
 - Lifestyle logging (custom tracked items like Alcohol, Illness, Matcha with YES/NO)
+- Blood pressure (manually logged measurements, per-day summary with all readings)
 - Floors and steps detail
 - Nutrition — individual food items per meal with full macros (requires Connect+)
 
@@ -78,7 +81,8 @@ Only go to the raw JSON files in `~/garmin_data/daily/` or `~/garmin_data/activi
 ## Sync behavior
 
 - **Incremental**: only fetches data since last sync (or 365 days on first run)
-- **Late-data refresh**: last 2 days always re-fetched (hydration, body comp, lifestyle logging arrive late)
+- **Late-data refresh**: last 14 days always re-fetched (lifestyle tags, hydration and food logs are often filled in retroactively; a shorter window left older days permanently stale)
+- **Midday mode**: `uv run sync_garmin_data.py --midday` refreshes today only (nutrition, daily metrics, blood pressure) — cheap intraday top-up
 - **Backfill**: missing files for existing days are automatically detected and fetched
 - **Rate limiting**: 1s delay between calls, exponential backoff on 429 errors (3 retries max)
 - **Failure tracking**: failed API calls logged per date/type, summary printed at end

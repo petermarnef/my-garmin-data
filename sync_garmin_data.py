@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["garminconnect>=0.2.38", "garth>=0.5.17", "requests>=2.0"]
+# dependencies = ["garminconnect>=0.3.3", "curl_cffi>=0.7.0", "requests>=2.0"]
 # ///
 """Garmin Connect Data Sync Script.
 
@@ -26,7 +26,6 @@ from getpass import getpass
 from pathlib import Path
 
 import requests
-from garth.exc import GarthException, GarthHTTPError
 
 from garminconnect import (
     Garmin,
@@ -39,6 +38,7 @@ logging.getLogger("garminconnect").setLevel(logging.CRITICAL)
 
 BASE_DIR = Path.home() / "garmin_data"
 SYNC_STATE_FILE = BASE_DIR / "sync_state.json"
+MIDDAY_SYNC_STATE_FILE = BASE_DIR / "midday_sync_state.json"
 HISTORY_DAYS = 365
 API_DELAY = 1.0
 MAX_RETRIES = 3
@@ -59,7 +59,7 @@ def init_api() -> Garmin | None:
         garmin.login(str(tokenstore_path))
         print("Authenticated with stored tokens.")
         return garmin
-    except (FileNotFoundError, GarthHTTPError, GarminConnectAuthenticationError,
+    except (FileNotFoundError, GarminConnectAuthenticationError,
             GarminConnectConnectionError) as e:
         if not sys.stdin.isatty():
             print(f"Token authentication failed and running non-interactively: {e}")
@@ -72,36 +72,22 @@ def init_api() -> Garmin | None:
             email = os.getenv("EMAIL") or input("Login email: ")
             password = os.getenv("PASSWORD") or getpass("Enter password: ")
 
-            garmin = Garmin(email=email, password=password, is_cn=False, return_on_mfa=True)
-            result1, result2 = garmin.login()
-
-            if result1 == "needs_mfa":
-                mfa_code = input("Enter MFA code: ")
-                try:
-                    garmin.resume_login(result2, mfa_code)
-                except GarthHTTPError as e:
-                    if "429" in str(e):
-                        print("Rate limited during MFA. Try again later.")
-                        sys.exit(1)
-                    elif "401" in str(e) or "403" in str(e):
-                        print("Invalid MFA code. Try again.")
-                        continue
-                    else:
-                        sys.exit(1)
-                except GarthException:
-                    print("MFA failed. Try again.")
-                    continue
-
-            garmin.garth.dump(str(tokenstore_path))
+            garmin = Garmin(
+                email=email,
+                password=password,
+                is_cn=False,
+                prompt_mfa=lambda: input("Enter MFA code: ").strip(),
+            )
+            garmin.login(str(tokenstore_path))
             print("Authenticated successfully.")
             return garmin
 
         except GarminConnectAuthenticationError:
             print("Invalid credentials. Try again.")
             continue
-        except (FileNotFoundError, GarthHTTPError, GarminConnectConnectionError,
-                requests.exceptions.HTTPError):
-            print("Connection error during login.")
+        except (FileNotFoundError, GarminConnectConnectionError,
+                requests.exceptions.HTTPError) as e:
+            print(f"Connection error during login: {e}")
             return None
         except KeyboardInterrupt:
             return None
@@ -113,8 +99,13 @@ def api_call(api_method, *args, **kwargs):
         try:
             result = api_method(*args, **kwargs)
             return result
-        except (GarminConnectTooManyRequestsError, GarthHTTPError) as e:
-            if "429" in str(e) or isinstance(e, GarminConnectTooManyRequestsError):
+        except GarminConnectTooManyRequestsError:
+            wait = RETRY_BACKOFF * (attempt + 1)
+            print(f"  Rate limited, waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        except GarminConnectConnectionError as e:
+            if "429" in str(e):
                 wait = RETRY_BACKOFF * (attempt + 1)
                 print(f"  Rate limited, waiting {wait}s...")
                 time.sleep(wait)
@@ -188,8 +179,10 @@ def sync_daily_data(api: Garmin, start: date, end: date):
 
     sorted_dates = sorted(dates_to_sync)
     total = len(sorted_dates)
-    # Always re-fetch last 2 days (data may be incomplete from earlier syncs)
-    refetch_cutoff = end - timedelta(days=1)
+    # Always re-fetch last 14 days (catches retroactive lifestyle/hydration
+    # logging — Garmin returns NULL status for items the user hasn't answered
+    # yet, and the JSON only updates if we re-fetch after the user logs)
+    refetch_cutoff = end - timedelta(days=13)
     for i, sync_date in enumerate(sorted_dates, 1):
         date_str = sync_date.isoformat()
         day_dir = daily_dir / date_str
@@ -216,6 +209,37 @@ def sync_daily_data(api: Garmin, start: date, end: date):
             else:
                 sync_failures.setdefault(date_str, []).append("body_battery.json")
             time.sleep(API_DELAY)
+
+
+def sync_blood_pressure(api: Garmin, start: date, end: date):
+    """Sync manually logged blood pressure measurements.
+
+    One range call; days with measurements get daily/<date>/blood_pressure.json.
+    Kept out of sync_daily_data's expected-files backfill because most days
+    have no BP entry at all.
+    """
+    print(f"Syncing blood pressure {start} to {end}...")
+    data = api_call(api.get_blood_pressure, start.isoformat(), end.isoformat())
+    if data is None:
+        sync_failures.setdefault("blood_pressure", []).append(f"{start}..{end}")
+        return
+    days_with_data = set()
+    for summary in data.get("measurementSummaries", []) or []:
+        date_str = summary.get("startDate")
+        if date_str:
+            days_with_data.add(date_str)
+            save_json(BASE_DIR / "daily" / date_str / "blood_pressure.json", summary)
+
+    # Remove stale local files for days whose measurements were deleted in
+    # Garmin (a deleted reading no longer appears in the range response)
+    current = start
+    while current <= end:
+        date_str = current.isoformat()
+        stale = BASE_DIR / "daily" / date_str / "blood_pressure.json"
+        if date_str not in days_with_data and stale.exists():
+            stale.unlink()
+            print(f"  removed stale blood pressure file for {date_str}")
+        current += timedelta(days=1)
 
 
 def sync_activities_full(api: Garmin):
@@ -400,25 +424,53 @@ def sync_personal_records(api: Garmin):
 
 
 def main():
+    midday_mode = "--midday" in sys.argv
+
     api = init_api()
     if not api:
         print("Failed to authenticate.")
         sys.exit(1)
 
     today = date.today()
+    sync_start_time = time.time()
+
+    if midday_mode:
+        print(f"Midday sync (today only): {today}")
+        sync_nutrition(api, today, today)
+        time.sleep(API_DELAY)
+        sync_daily_data(api, today, today)
+        time.sleep(API_DELAY)
+        sync_blood_pressure(api, today, today)
+        save_json(MIDDAY_SYNC_STATE_FILE, {"last_sync_at": datetime.now().isoformat()})
+        elapsed = int(time.time() - sync_start_time)
+        if sync_failures:
+            total_failures = sum(len(v) for v in sync_failures.values())
+            print(f"\n⚠ Midday sync complete ({elapsed}s) with {total_failures} failure(s).")
+        else:
+            print(f"\n✓ Midday sync complete ({elapsed}s, no failures).")
+        return
+
     last_sync = load_sync_state()
 
     if last_sync:
-        start_date = last_sync
+        # Start at least 14 days back so retroactively logged data (lifestyle
+        # tags, water, food) is re-fetched. The [refresh] flag inside
+        # sync_daily_data/sync_nutrition only forces re-fetch for dates that
+        # are actually in the sync range — without this floor, days older
+        # than the incremental window were never revisited and late logging
+        # stayed permanently stale locally.
+        start_date = min(last_sync, today - timedelta(days=13))
         print(f"Incremental sync from {start_date} to {today}")
     else:
         start_date = today - timedelta(days=HISTORY_DAYS)
         print(f"Initial sync: {start_date} to {today} ({HISTORY_DAYS} days)")
 
-    sync_start_time = time.time()
-
     # Daily data
     sync_daily_data(api, start_date, today)
+    time.sleep(API_DELAY)
+
+    # Blood pressure (manual/device measurements, started 2026-07-15)
+    sync_blood_pressure(api, start_date, today)
     time.sleep(API_DELAY)
 
     # Activities

@@ -23,7 +23,7 @@ from pathlib import Path
 GARMIN_DATA = Path.home() / "garmin_data"
 DAILY_DIR = GARMIN_DATA / "daily"
 ACTIVITIES_DIR = GARMIN_DATA / "activities"
-BODY_COMP_FILE = GARMIN_DATA / "body_composition" / "body_comp.json"
+BODY_COMP_FILE = GARMIN_DATA / "body_composition" / "body_comp_full.json"
 WEIGH_INS_FILE = GARMIN_DATA / "body_composition" / "weigh_ins.json"
 NUTRITION_DIR = GARMIN_DATA / "nutrition"
 PERSONAL_RECORDS_FILE = GARMIN_DATA / "personal_records.json"
@@ -380,11 +380,12 @@ def extract_activity(filepath: Path) -> dict | None:
 
 
 def extract_body_comp() -> list[dict]:
-    """Extract body composition rows from body_comp.json."""
+    """Extract body composition rows from body_comp_full.json (list)
+    or legacy body_comp.json (dict with dateWeightList)."""
     data = load_json(BODY_COMP_FILE)
     if not data:
         return []
-    entries = g(data, "dateWeightList") or []
+    entries = data if isinstance(data, list) else (g(data, "dateWeightList") or [])
     rows = []
     for entry in entries:
         weight_raw = g(entry, "weight")
@@ -629,9 +630,11 @@ def process_daily(state: dict) -> tuple[list[dict], int]:
     all_dates = sorted(
         d.name for d in DAILY_DIR.iterdir() if d.is_dir() and d.name[:4].isdigit()
     )
-    # Always refresh last 2 days (data may arrive late: hydration, weight, etc.)
+    # Always re-extract last 90 days (cheap local-only reads; picks up
+    # retroactive Garmin edits — hydration, lifestyle tags, sleep score
+    # corrections — that sync re-fetched but processed_dates would skip)
     from datetime import date, timedelta
-    refresh_cutoff = (date.today() - timedelta(days=1)).isoformat()
+    refresh_cutoff = (date.today() - timedelta(days=89)).isoformat()
     refresh_dates = [d for d in all_dates if d >= refresh_cutoff and d in processed]
     new_dates = [d for d in all_dates if d not in processed]
     dates_to_process = sorted(set(new_dates + refresh_dates))
