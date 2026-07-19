@@ -428,8 +428,13 @@ def main():
 
     api = init_api()
     if not api:
-        print("Failed to authenticate.")
-        sys.exit(1)
+        # Distinct exit code (3) so the caller can tell "Garmin auth expired"
+        # apart from a generic failure and alert loudly instead of silently
+        # re-delivering a stale result. The GARMIN_AUTH_FAILED sentinel is
+        # matched by the nightly pipeline prompt.
+        print("GARMIN_AUTH_FAILED: Garmin-authenticatie mislukt — token verlopen of "
+              "ongeldig. Herauth nodig: cd ~/dev/my-garmin-data && uv run sync_garmin_data.py")
+        sys.exit(3)
 
     today = date.today()
     sync_start_time = time.time()
