@@ -40,6 +40,7 @@ BASE_DIR = Path.home() / "garmin_data"
 SYNC_STATE_FILE = BASE_DIR / "sync_state.json"
 MIDDAY_SYNC_STATE_FILE = BASE_DIR / "midday_sync_state.json"
 HISTORY_DAYS = 365
+MISSING_FILE_BACKFILL_DAYS = 30
 API_DELAY = 1.0
 MAX_RETRIES = 3
 RETRY_BACKOFF = 5
@@ -169,13 +170,17 @@ def sync_daily_data(api: Garmin, start: date, end: date):
         current += timedelta(days=1)
 
     expected_files = {fname for fname, _ in daily_calls} | {"body_battery.json"}
+    missing_backfill_cutoff = end - timedelta(days=MISSING_FILE_BACKFILL_DAYS - 1)
     if daily_dir.exists():
         for day_dir in daily_dir.iterdir():
             if not day_dir.is_dir() or not day_dir.name[:4].isdigit():
                 continue
+            day = date.fromisoformat(day_dir.name)
+            if day < missing_backfill_cutoff:
+                continue
             existing_files = {f.name for f in day_dir.iterdir() if f.is_file()}
             if not expected_files.issubset(existing_files):
-                dates_to_sync.add(date.fromisoformat(day_dir.name))
+                dates_to_sync.add(day)
 
     sorted_dates = sorted(dates_to_sync)
     total = len(sorted_dates)
