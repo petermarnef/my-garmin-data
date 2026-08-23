@@ -445,12 +445,19 @@ def main():
     sync_start_time = time.time()
 
     if midday_mode:
-        print(f"Midday sync (today only): {today}")
-        sync_nutrition(api, today, today)
+        # Yesterday is included on purpose. Food logged late — the evening
+        # meal entered the next morning — used to sit in a blind spot: the
+        # nightly full sync had already run, and a midday sync scoped to
+        # today alone never revisited it, so the correction only landed the
+        # NEXT night. All three calls below force a re-fetch inside their
+        # own window, so a two-day range genuinely refreshes both days.
+        yesterday = today - timedelta(days=1)
+        print(f"Midday sync (yesterday + today): {yesterday} .. {today}")
+        sync_nutrition(api, yesterday, today)
         time.sleep(API_DELAY)
-        sync_daily_data(api, today, today)
+        sync_daily_data(api, yesterday, today)
         time.sleep(API_DELAY)
-        sync_blood_pressure(api, today, today)
+        sync_blood_pressure(api, yesterday, today)
         save_json(MIDDAY_SYNC_STATE_FILE, {"last_sync_at": datetime.now().isoformat()})
         elapsed = int(time.time() - sync_start_time)
         if sync_failures:
